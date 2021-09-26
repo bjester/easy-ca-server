@@ -1,0 +1,144 @@
+#!/bin/bash
+
+set -e
+
+DEFAULT_KEY="~/.ssh/id_rsa"
+VERSION=$(cat ./VERSION)
+
+echo "A public/private OpenSSH key pair are used to encrypt the easy-ca-server container."
+echo "You may specify an existing set, or a new path to generate new keys."
+read -e -p "What key pair would you like to use? Path to private key: [${DEFAULT_KEY}] " MY_PRIVATE_KEY
+MY_PRIVATE_KEY=${MY_PRIVATE_KEY:-${DEFAULT_KEY}}
+MY_PRIVATE_KEY=${MY_PRIVATE_KEY/#\~/${HOME}}
+MY_PEM_PRIVATE_KEY="${MY_PRIVATE_KEY}.pem"
+MY_PUBLIC_KEY="${MY_PRIVATE_KEY}.pub"
+MY_PEM_PUBLIC_KEY="${MY_PUBLIC_KEY}.pem"
+
+if [ ! -f "${MY_PRIVATE_KEY}" ]; then
+  echo "Key '${MY_PRIVATE_KEY}' not found, generating..."
+  ssh-keygen -t rsa -b 2048 -m pem -f "${MY_PRIVATE_KEY}"
+  echo "Created key pair '${MY_PRIVATE_KEY}' '${MY_PUBLIC_KEY}'"
+fi
+
+if [ ! -f "${MY_PEM_PRIVATE_KEY}" ]; then
+  echo "Generating PEM private key..."
+  openssl rsa -in "${MY_PRIVATE_KEY}" -out "${MY_PEM_PRIVATE_KEY}"
+  echo "Created ${MY_PEM_PRIVATE_KEY}"
+else
+  echo "Found PEM private key '${MY_PEM_PRIVATE_KEY}'"
+fi
+
+if [ ! -f "${MY_PEM_PUBLIC_KEY}" ]; then
+  echo "Generating PEM public key..."
+  ssh-keygen -f "${MY_PUBLIC_KEY}" -e -m pem > "${MY_PEM_PUBLIC_KEY}"
+  echo "Created '${MY_PEM_PUBLIC_KEY}'"
+else
+  echo "Found PEM public key '${MY_PEM_PUBLIC_KEY}'"
+fi
+
+mkdir -p build
+echo "Created 'build/'"
+
+if [ ! -f "./build/vars" ]; then
+  cp vars build/vars
+  echo "Created 'build/vars'"
+else
+  echo "Found vars: 'build/vars'"
+fi
+
+DEFAULT_MOUNT_DIR="./build/data"
+echo "The easy-ca-server container will mount a directory to output encrypted CA files for persistence."
+read -e -p "Where would you like this directory mounted on the host? [${DEFAULT_MOUNT_DIR}] " MOUNT_DIR
+MOUNT_DIR=${MOUNT_DIR:-${DEFAULT_MOUNT_DIR}}
+MOUNT_DIR=$(realpath --relative-to=./build "$MOUNT_DIR")
+
+CA_USER=${USER}
+CA_UID=$(id -u ${CA_USER})
+WORKING_DIR="/home/${CA_USER}/easy-ca-server"
+
+SINGULARITY_EXEC_ARGS="--writable-tmpfs --bind ${MOUNT_DIR}:/mnt/easy-ca-server/ --containall"
+SINGULARITY_DEF=easy-ca-server.def
+
+cat > build/Makefile <<_EOF
+CONTAINER = easy-ca-server.sif
+INSTANCE = easy-ca-server
+MOUNT_DIR = $MOUNT_DIR
+
+\$(CONTAINER): | random/
+	@singularity build --pem-path "${MY_PEM_PUBLIC_KEY}" \$@ ./${SINGULARITY_DEF}
+
+build: | \$(CONTAINER)
+	@rm -rf ./random
+	@echo "Built container \$(CONTAINER)"
+	@echo "Use 'make start|shell|stop' to use it"
+
+clean:
+	@rm -rf ./random
+
+\$(MOUNT_DIR):
+	@mkdir -p \$(MOUNT_DIR)
+
+shell:
+	@singularity shell instance://\$(INSTANCE)
+
+standalone-shell:
+	@singularity shell ${SINGULARITY_EXEC_ARGS} --pem-path "${MY_PEM_PRIVATE_KEY}" \$(CONTAINER)
+
+start: | \$(MOUNT_DIR)
+	@singularity instance start ${SINGULARITY_EXEC_ARGS} --pem-path "${MY_PEM_PRIVATE_KEY}" \$(CONTAINER) \$(INSTANCE)
+
+stop:
+	@singularity instance stop \$(INSTANCE)
+
+random/:
+	@mkdir random
+	@for i in \$\$(seq 256); do openssl rand 256 > ./random/\$\$i; done
+
+.PHONY: build start stop shell standalone-shell
+_EOF
+echo "Created 'build/Makefile'"
+
+cat > "build/${SINGULARITY_DEF}" <<_EOF
+Bootstrap: docker
+From: alpine:latest
+
+%files
+    ../scripts /opt/easy-ca-server
+    ./random /opt/easy-ca-server/random
+    ./vars /opt/easy-ca-server/vars
+
+%post
+    apk add --update bash easy-rsa inotify-tools gnupg openssl
+    chmod +x /opt/easy-ca-server/*.sh
+    mkdir -p "${WORKING_DIR}"
+    /opt/easy-ca-server/init.sh "${CA_USER}" ${CA_UID} "${WORKING_DIR}"
+    CONFIGURE_TIME="$(date)"
+    BUILD_TIME=\$(date)
+    BUILD_ID=\$(echo \${BUILD_TIME} | sha1sum | cut -d " " -f 1)
+    echo "export BUILD_TIME=\"\${BUILD_TIME}\"" >> \$SINGULARITY_ENVIRONMENT
+    echo "export BUILD_ID=\"\${BUILD_ID}\"" >> \$SINGULARITY_ENVIRONMENT
+
+%environment
+    export LC_ALL=C
+    export DIR_CA=/opt/easy-ca-server
+    export DIR_CA_WORKING_DIR=${WORKING_DIR}
+    export DIR_CA_MNT=/mnt/easy-ca-server
+
+%startscript
+    /opt/easy-ca-server/decrypt-loader.sh
+    /opt/easy-ca-server/encrypt-service.sh
+
+%runscript
+    echo "easy-ca-server ${VERSION}"
+    echo "  built: \$BUILD_TIME"
+    echo "  build: \$BUILD_ID"
+    exec bash -c "\$@"
+_EOF
+echo "Created 'build/${SINGULARITY_DEF}'"
+
+
+
+echo "DONE!"
+echo "Next steps:"
+echo "  1) Edit 'build/vars'"
+echo "  2) Run 'sudo make -C build build'"
